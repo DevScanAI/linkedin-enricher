@@ -15,7 +15,7 @@ from lib.utils import (
 )
 
 
-def fetch_guests_pending_for_enrichment(limit):
+def fetch_guests_pending_for_enrichment(limit, luma_event_api_id=None):
     """
     Fetch guests with LinkedIn handles needing enrichment or retry.
 
@@ -26,6 +26,7 @@ def fetch_guests_pending_for_enrichment(limit):
 
     Args:
         limit: Maximum number of guests to fetch
+        luma_event_api_id: Optional event ID to filter guests by specific event
 
     Returns:
         list: List of tuples (luma_guest_api_id, guest_name, linkedin_handle, retry_count)
@@ -34,16 +35,30 @@ def fetch_guests_pending_for_enrichment(limit):
     import time
     current_timestamp = int(time.time() * 1000)
 
-    query = """
+    # Build event filter join if needed
+    event_join = ""
+    event_filter = ""
+    params = [current_timestamp]
+
+    if luma_event_api_id:
+        event_join = "JOIN luma.event_guests eg ON eg.luma_guest_api_id = g.luma_guest_api_id"
+        event_filter = "AND eg.luma_event_api_id = %s"
+        params.append(luma_event_api_id)
+
+    params.append(limit)
+
+    query = f"""
     SELECT
         g.luma_guest_api_id,
         g.guest_name,
         g.linkedin_handle,
         COALESCE(lp.retry_count, 0) as retry_count
     FROM luma.guests g
+    {event_join}
     LEFT JOIN luma.linkedin_profiles lp
         ON lp.luma_guest_api_id = g.luma_guest_api_id
     WHERE g.linkedin_handle IS NOT NULL
+    {event_filter}
     AND (
         -- Never enriched
         lp.luma_guest_api_id IS NULL
@@ -62,7 +77,7 @@ def fetch_guests_pending_for_enrichment(limit):
     """
 
     if open_connection():
-        results = execute_query(query, params=(current_timestamp, limit), is_select_query=True)
+        results = execute_query(query, params=tuple(params), is_select_query=True)
         close_connection()
         return results
     return None
@@ -142,7 +157,7 @@ def upsert_linkedin_profiles(profile_records):
     return False
 
 
-def enrich_linkedin_profiles(batch_size):
+def enrich_linkedin_profiles(batch_size, luma_event_api_id=None):
     """
     Main enrichment workflow.
 
@@ -154,11 +169,13 @@ def enrich_linkedin_profiles(batch_size):
 
     Args:
         batch_size: Number of guests to process in this batch
+        luma_event_api_id: Optional event ID to filter guests by specific event
     """
     # Step 1: Fetch guests from database
-    pending_guests = fetch_guests_pending_for_enrichment(batch_size)
+    pending_guests = fetch_guests_pending_for_enrichment(batch_size, luma_event_api_id)
     if not pending_guests:
-        print("No guests need LinkedIn enrichment")
+        event_msg = f" for event {luma_event_api_id}" if luma_event_api_id else ""
+        print(f"No guests need LinkedIn enrichment{event_msg}")
         return
 
     # Count retries vs new attempts
@@ -166,7 +183,8 @@ def enrich_linkedin_profiles(batch_size):
     new_attempts = sum(1 for count in retry_counts if count == 0)
     retries = len(pending_guests) - new_attempts
 
-    print(f"Found {len(pending_guests)} guests needing enrichment")
+    event_msg = f" for event {luma_event_api_id}" if luma_event_api_id else ""
+    print(f"Found {len(pending_guests)} guests needing enrichment{event_msg}")
     if retries > 0:
         print(f"  - {new_attempts} new attempts")
         print(f"  - {retries} retries")
@@ -226,6 +244,12 @@ def main():
         default=None,
         help='Comma-separated LinkedIn handles for manual enrichment'
     )
+    parser.add_argument(
+        '--event-id',
+        type=str,
+        default=None,
+        help='Luma event API ID to filter guests by specific event'
+    )
 
     args = parser.parse_args()
 
@@ -234,7 +258,7 @@ def main():
         print(f"Manual mode not yet implemented")
         print(f"Will process: {args.profiles}")
     else:
-        enrich_linkedin_profiles(args.count)
+        enrich_linkedin_profiles(args.count, args.event_id)
 
 
 if __name__ == '__main__':
