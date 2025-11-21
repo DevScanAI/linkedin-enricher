@@ -37,16 +37,6 @@ def normalize_linkedin_handle(linkedin_url_or_handle):
 
 
 def create_lookup_from_apify_profiles(apify_profiles):
-    """
-    Index Apify profiles by LinkedIn handle for fast lookup.
-
-    Args:
-        apify_profiles: Raw profile list from Apify API
-
-    Returns:
-        dict: {linkedin_handle: apify_profile_dict}
-              e.g., {"/in/artsofbaniya": {...profile_data...}}
-    """
     handle_to_profile = {}
     for profile in apify_profiles:
         public_id = profile.get('publicIdentifier', '')
@@ -56,67 +46,36 @@ def create_lookup_from_apify_profiles(apify_profiles):
     return handle_to_profile
 
 
-def match_guest_to_apify_profile(guest_record, apify_profile_lookup):
-    """
-    Find Apify profile for a specific guest.
-
-    Args:
-        guest_record: Tuple of (luma_guest_api_id, guest_name, linkedin_handle[, retry_count])
-        apify_profile_lookup: Dict from create_lookup_from_apify_profiles()
-
-    Returns:
-        dict or None: Apify profile if found, None if unavailable
-    """
-    # Handle both 3-tuple and 4-tuple formats
-    linkedin_handle = guest_record[2]
+def match_record_to_apify_profile(record, apify_profile_lookup):
+    linkedin_handle = record[3]
     normalized_handle = normalize_linkedin_handle(linkedin_handle)
     return apify_profile_lookup.get(normalized_handle)
 
 
-def partition_guests_by_profile_availability(pending_guests, apify_profile_lookup):
-    """
-    Split guests by whether Apify returned their profile.
-
-    Args:
-        pending_guests: List of guest tuples needing enrichment
-        apify_profile_lookup: Handle → profile dict
-
-    Returns:
-        tuple: (guests_with_profiles, guests_without_profiles)
-            guests_with_profiles: [(apify_profile_dict, guest_record), ...]
-            guests_without_profiles: [guest_record, ...]
-    """
+def partition_records_by_profile_availability(pending_records, apify_profile_lookup):
     with_profiles = []
     without_profiles = []
 
-    for guest in pending_guests:
-        apify_profile = match_guest_to_apify_profile(guest, apify_profile_lookup)
+    for record in pending_records:
+        apify_profile = match_record_to_apify_profile(record, apify_profile_lookup)
         if apify_profile:
-            with_profiles.append((apify_profile, guest))
+            with_profiles.append((apify_profile, record))
         else:
-            without_profiles.append(guest)
+            without_profiles.append(record)
 
     return with_profiles, without_profiles
 
 
-def build_enriched_profile_record(apify_profile, guest_record):
-    """
-    Transform Apify profile into database record format.
-
-    Args:
-        apify_profile: Raw profile dict from Apify
-        guest_record: Tuple of (luma_guest_api_id, guest_name, linkedin_handle[, retry_count])
-
-    Returns:
-        tuple: Complete database record with all fields populated
-    """
-    # Handle both 3-tuple and 4-tuple formats
-    luma_guest_api_id = guest_record[0]
-    guest_name = guest_record[1]
-    linkedin_handle = guest_record[2]
+def build_enriched_profile_record(apify_profile, record):
+    luma_guest_api_id = record[0]
+    social_link_url = record[1]
+    link_provider = record[2]
+    linkedin_handle = record[3]
 
     return (
         luma_guest_api_id,
+        social_link_url,
+        link_provider,
         linkedin_handle,
         'apify',  # record_source
         True,     # profile_found
@@ -151,23 +110,8 @@ def build_enriched_profile_record(apify_profile, guest_record):
     )
 
 
-def build_missing_profile_record(guest_record, current_retry_count=0):
-    """
-    Create record for guest with no available LinkedIn profile.
-
-    Args:
-        guest_record: Tuple of (luma_guest_api_id, guest_name, linkedin_handle, retry_count)
-        current_retry_count: Current retry count from database (default 0 for new records)
-
-    Returns:
-        tuple: Database record marking profile as not found with retry tracking
-    """
-    # Unpack guest record (may have 3 or 4 fields depending on source)
-    if len(guest_record) == 4:
-        luma_guest_api_id, guest_name, linkedin_handle, db_retry_count = guest_record
-        current_retry_count = db_retry_count or 0
-    else:
-        luma_guest_api_id, guest_name, linkedin_handle = guest_record
+def build_missing_profile_record(record, current_retry_count=0):
+    github_user_id, social_link_url, link_provider, linkedin_handle = record
 
     import time
     current_timestamp = int(time.time() * 1000)  # epoch milliseconds
@@ -178,8 +122,11 @@ def build_missing_profile_record(guest_record, current_retry_count=0):
     next_retry_timestamp = current_timestamp + (backoff_minutes * 60 * 1000)
 
     return (
-        luma_guest_api_id,
+        github_user_id,
+        social_link_url,
+        link_provider,
         linkedin_handle,
+        social_link,
         'apify',  # record_source
         False,    # profile_found
         'Profile not returned by Apify API',  # profile_fetch_message

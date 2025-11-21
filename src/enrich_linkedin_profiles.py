@@ -1,7 +1,7 @@
 """
 LinkedIn Profile Enrichment Script
 
-Fetches LinkedIn profile data for guests and stores in database.
+Fetches LinkedIn profile data for pending records and stores in database.
 """
 
 import argparse
@@ -9,70 +9,42 @@ from lib.db.postgres import open_connection, close_connection, execute_query, up
 from lib.apify import get_linkedin_profiles
 from lib.utils import (
     create_lookup_from_apify_profiles,
-    partition_guests_by_profile_availability,
+    partition_records_by_profile_availability,
     build_enriched_profile_record,
     build_missing_profile_record,
 )
 
 
-def fetch_guests_pending_for_enrichment(limit, luma_event_api_id=None):
-    """
-    Fetch guests with LinkedIn handles needing enrichment or retry.
-
-    Fetches guests that either:
-    1. Have never been enriched (no record in linkedin_profiles)
-    2. Failed enrichment but under max retry limit (retry_count < 3)
-    3. Retry backoff period has passed (next_retry_after < current_time)
-
-    Args:
-        limit: Maximum number of guests to fetch
-        luma_event_api_id: Optional event ID to filter guests by specific event
-
-    Returns:
-        list: List of tuples (luma_guest_api_id, guest_name, linkedin_handle, retry_count)
-              or None if connection failed
-    """
+def fetch_records_pending_for_enrichment(limit):
     import time
     current_timestamp = int(time.time() * 1000)
 
-    # Build event filter join if needed
-    event_join = ""
-    event_filter = ""
     params = [current_timestamp]
-
-    if luma_event_api_id:
-        event_join = "JOIN luma.event_guests eg ON eg.luma_guest_api_id = g.luma_guest_api_id"
-        event_filter = "AND eg.luma_event_api_id = %s"
-        params.append(luma_event_api_id)
-
     params.append(limit)
 
     query = f"""
     SELECT
-        g.luma_guest_api_id,
-        g.guest_name,
-        g.linkedin_handle,
-        COALESCE(lp.retry_count, 0) as retry_count
-    FROM luma.guests g
-    {event_join}
-    LEFT JOIN luma.linkedin_profiles lp
-        ON lp.luma_guest_api_id = g.luma_guest_api_id
-    WHERE g.linkedin_handle IS NOT NULL
-    {event_filter}
+        lud.github_user_id,
+        lud.social_link_url,
+        lud.link_provider,
+        lud.linkedin_handle,
+        COALESCE(lud.retry_count, 0) as retry_count
+    FROM linkedin.user_details lud
+    WHERE lud.linkedin_handle IS NOT NULL
     AND (
         -- Never enriched
-        lp.luma_guest_api_id IS NULL
+        lud.retry_count IS NULL
         OR
         -- Failed enrichment eligible for retry
         (
-            lp.profile_found = FALSE
-            AND lp.retry_count < 3
-            AND (lp.next_retry_after IS NULL OR lp.next_retry_after < %s)
+            lud.profile_found IS FALSE
+            AND lud.retry_count < 3
+            AND (lud.next_retry_after IS NULL OR lud.next_retry_after < %s)
         )
     )
     ORDER BY
-        COALESCE(lp.retry_count, 0) ASC,  -- Prioritize new attempts
-        lp.last_retry_at ASC NULLS FIRST  -- Then oldest retries
+        COALESCE(lud.retry_count, 0) ASC,  -- Prioritize new attempts
+        lud.last_retry_at ASC NULLS FIRST  -- Then oldest retries
     LIMIT %s
     """
 
@@ -84,22 +56,15 @@ def fetch_guests_pending_for_enrichment(limit, luma_event_api_id=None):
 
 
 def upsert_linkedin_profiles(profile_records):
-    """
-    Batch upsert profile records to database.
-
-    Args:
-        profile_records: List of tuples (database records)
-
-    Returns:
-        bool: True if successful, False otherwise
-    """
     if not profile_records:
         print("No records to upsert")
         return True
 
     # Column order must match the record tuple order in build_*_profile_record()
     columns = [
-        'luma_guest_api_id',
+        'github_user_id',
+        'social_link_url',
+        'link_provider',
         'linkedin_handle',
         'record_source',
         'profile_found',
@@ -134,7 +99,7 @@ def upsert_linkedin_profiles(profile_records):
     ]
 
     # Columns to detect conflicts (unique constraint)
-    conflict_columns = ['luma_guest_api_id', 'linkedin_handle']
+    conflict_columns = ['github_user_id', 'linkedin_handle']
 
     # Columns to update on conflict (all except conflict columns)
     update_columns = [col for col in columns if col not in conflict_columns]
@@ -143,7 +108,7 @@ def upsert_linkedin_profiles(profile_records):
         try:
             upsert_multiple_records(
                 profile_records,
-                'luma.linkedin_profiles',
+                'linkedin.user_details',
                 columns,
                 conflict_columns,
                 update_columns
@@ -157,62 +122,47 @@ def upsert_linkedin_profiles(profile_records):
     return False
 
 
-def enrich_linkedin_profiles(batch_size, luma_event_api_id=None):
-    """
-    Main enrichment workflow.
-
-    1. Fetch guests needing enrichment
-    2. Call Apify API to get LinkedIn profiles
-    3. Match returned profiles to guests
-    4. Build database records for matches and misses
-    5. Upsert all records to database
-
-    Args:
-        batch_size: Number of guests to process in this batch
-        luma_event_api_id: Optional event ID to filter guests by specific event
-    """
+def enrich_linkedin_profiles(batch_size):
     # Step 1: Fetch guests from database
-    pending_guests = fetch_guests_pending_for_enrichment(batch_size, luma_event_api_id)
-    if not pending_guests:
-        event_msg = f" for event {luma_event_api_id}" if luma_event_api_id else ""
-        print(f"No guests need LinkedIn enrichment{event_msg}")
+    pending_records = fetch_records_pending_for_enrichment(batch_size)
+    if not pending_records:
+        print(f"No records need LinkedIn enrichment")
         return
 
     # Count retries vs new attempts
-    retry_counts = [guest[3] if len(guest) > 3 else 0 for guest in pending_guests]
+    retry_counts = [record[4] for record in pending_records]
     new_attempts = sum(1 for count in retry_counts if count == 0)
-    retries = len(pending_guests) - new_attempts
+    retries = len(pending_records) - new_attempts
 
-    event_msg = f" for event {luma_event_api_id}" if luma_event_api_id else ""
-    print(f"Found {len(pending_guests)} guests needing enrichment{event_msg}")
+    print(f"Found {len(pending_records)} guests needing enrichment")
     if retries > 0:
         print(f"  - {new_attempts} new attempts")
-        print(f"  - {retries} retries")
+        print(f"  - {retries} retries")    
 
     # Step 2: Build LinkedIn URLs and call Apify API
     linkedin_urls = [
-        f"https://www.linkedin.com{guest[2]}"
-        for guest in pending_guests
+        f"https://www.linkedin.com/{record[3]}"
+        for record in pending_records
     ]
     apify_profiles = get_linkedin_profiles(linkedin_urls)
 
-    # Step 3: Create lookup and partition guests
+    # Step 3: Create lookup and partition records
     profile_lookup = create_lookup_from_apify_profiles(apify_profiles)
-    guests_with_profiles, guests_without_profiles = partition_guests_by_profile_availability(
-        pending_guests,
+    records_with_profiles, records_without_profiles = partition_records_by_profile_availability(
+        pending_records,
         profile_lookup
     )
 
-    print(f"Matched {len(guests_with_profiles)} profiles, {len(guests_without_profiles)} missing")
+    print(f"Matched {len(records_with_profiles)} profiles, {len(records_without_profiles)} missing")
 
     # Step 4: Build database records
     enriched_records = [
-        build_enriched_profile_record(profile, guest)
-        for profile, guest in guests_with_profiles
+        build_enriched_profile_record(profile, record)
+        for profile, record in records_with_profiles
     ]
     missing_records = [
-        build_missing_profile_record(guest)
-        for guest in guests_without_profiles
+        build_missing_profile_record(record)
+        for record in records_without_profiles
     ]
 
     # Step 5: Upsert to database
@@ -244,12 +194,6 @@ def main():
         default=None,
         help='Comma-separated LinkedIn handles for manual enrichment'
     )
-    parser.add_argument(
-        '--event-id',
-        type=str,
-        default=None,
-        help='Luma event API ID to filter guests by specific event'
-    )
 
     args = parser.parse_args()
 
@@ -258,7 +202,7 @@ def main():
         print(f"Manual mode not yet implemented")
         print(f"Will process: {args.profiles}")
     else:
-        enrich_linkedin_profiles(args.count, args.event_id)
+        enrich_linkedin_profiles(args.count)
 
 
 if __name__ == '__main__':
