@@ -67,13 +67,13 @@ def partition_records_by_profile_availability(pending_records, apify_profile_loo
 
 
 def build_enriched_profile_record(apify_profile, record):
-    luma_guest_api_id = record[0]
+    github_user_id = record[0]
     social_link_url = record[1]
     link_provider = record[2]
     linkedin_handle = record[3]
 
     return (
-        luma_guest_api_id,
+        github_user_id,
         social_link_url,
         link_provider,
         linkedin_handle,
@@ -111,7 +111,10 @@ def build_enriched_profile_record(apify_profile, record):
 
 
 def build_missing_profile_record(record, current_retry_count=0):
-    github_user_id, social_link_url, link_provider, linkedin_handle = record
+    github_user_id = record[0]
+    social_link_url = record[1]
+    link_provider = record[2]
+    linkedin_handle = record[3]
 
     import time
     current_timestamp = int(time.time() * 1000)  # epoch milliseconds
@@ -126,9 +129,8 @@ def build_missing_profile_record(record, current_retry_count=0):
         social_link_url,
         link_provider,
         linkedin_handle,
-        social_link,
         'apify',  # record_source
-        False,    # profile_found
+        False,    # profile_foundgi
         'Profile not returned by Apify API',  # profile_fetch_message
         *([None] * 23),  # 23 None values for profile fields (full_name through top_skills_by_endorsements)
         None,  # profile_data JSONB
